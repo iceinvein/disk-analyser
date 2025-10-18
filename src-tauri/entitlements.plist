@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS Entitlements for Disk Analyser
+  
+  This file configures the app's permissions on macOS.
+  
+  IMPORTANT: Users must grant "Full Disk Access" permission in System Settings
+  for the app to scan system directories like Macintosh HD.
+  
+  See MACOS_PERMISSIONS.md for setup instructions.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Allow reading files from anywhere on the filesystem -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    
+    <!-- Allow the app to access all files (requires Full Disk Access permission) -->
+    <key>com.apple.security.files.all</key>
+    <string>read-write</string>
+    
+    <!-- Disable App Sandbox to allow full filesystem access -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+</dict>
+</plist>
