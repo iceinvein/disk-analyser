@@ -9,6 +9,8 @@ import {
 import { SidebarNavigator } from './components/SidebarNavigator';
 import { ProgressIndicator } from './components/ProgressIndicator';
 import { MillerColumns } from './components/MillerColumns';
+import { LargestFilesView } from './components/LargestFilesView';
+import { ViewModeTabs } from './components/ViewModeTabs';
 import { DeletionDialog } from './components/DeletionDialog';
 import { PermissionDialog } from './components/PermissionDialog';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -23,6 +25,7 @@ import {
   $scanTarget,
   $showPermissionDialog,
   $permissionDialogPath,
+  $viewMode,
 } from './stores';
 import { scanDirectoryStreaming } from './services/scanService';
 
@@ -58,6 +61,7 @@ function App() {
   const scanTarget = useStore($scanTarget);
   const showPermissionDialog = useStore($showPermissionDialog);
   const permissionDialogPath = useStore($permissionDialogPath);
+  const viewMode = useStore($viewMode);
   const [isDeletionDialogOpen, setIsDeletionDialogOpen] = useState(false);
 
   // Calculate total size of selected items
@@ -165,9 +169,16 @@ function App() {
         <main className="flex-1 flex flex-col overflow-hidden" role="main">
           {currentView ? (
             <>
-              {/* Full-width Miller Columns */}
+              {/* View Mode Tabs */}
+              <ViewModeTabs />
+
+              {/* Content Area - Conditionally render based on view mode */}
               <div className="flex-1 flex flex-col overflow-hidden">
-                <MillerColumns />
+                {viewMode === 'miller-columns' ? (
+                  <MillerColumns />
+                ) : (
+                  <LargestFilesView />
+                )}
 
                 {/* Action Bar - Bottom (always visible) */}
                 <div

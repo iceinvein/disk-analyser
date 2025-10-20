@@ -6,6 +6,7 @@ import type {
   SortConfig,
   StorageLocation,
   FileType,
+  ViewMode,
 } from './types';
 import { perfMonitor } from './utils/performance';
 
@@ -35,6 +36,7 @@ export const $scanError = atom<string | null>(null);
 export const $canResumeScan = atom<boolean>(false);
 export const $showPermissionDialog = atom<boolean>(false);
 export const $permissionDialogPath = atom<string>('');
+export const $viewMode = atom<ViewMode>('miller-columns');
 
 // Scan cache - stores scan results by path
 export const $scanCache = map<Record<string, FileNode>>({});
@@ -345,6 +347,14 @@ export function toggleSelection(path: string): void {
 }
 
 /**
+ * Set selected items
+ * @param items - The new selection state
+ */
+export function setSelectedItems(items: Record<string, boolean>): void {
+  $selectedItems.set(items);
+}
+
+/**
  * Clear all selected items
  */
 export function clearSelection(): void {
@@ -369,6 +379,14 @@ export function setSortConfig(
  */
 export function setFilterText(text: string): void {
   $filterText.set(text);
+}
+
+/**
+ * Set view mode
+ * @param mode - View mode to set
+ */
+export function setViewMode(mode: ViewMode): void {
+  $viewMode.set(mode);
 }
 
 /**

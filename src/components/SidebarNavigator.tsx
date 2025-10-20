@@ -244,7 +244,7 @@ export function SidebarNavigator() {
                         <>
                           <div className="text-xs text-gray-400 mt-1">
                             {formatSize(
-                              location.total_space - location.available_space,
+                              location.total_space - (location.available_space ?? 0),
                             )}{' '}
                             of {formatSize(location.total_space)}
                           </div>
@@ -253,7 +253,7 @@ export function SidebarNavigator() {
                             <div
                               className="h-full bg-gradient-to-r from-cyan-500 via-purple-500 to-pink-500 rounded-full transition-all duration-300"
                               style={{
-                                width: `${((location.total_space - location.available_space) / location.total_space) * 100}%`,
+                                width: `${((location.total_space - (location.available_space ?? 0)) / location.total_space) * 100}%`,
                               }}
                             />
                           </div>

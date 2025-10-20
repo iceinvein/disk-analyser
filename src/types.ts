@@ -19,7 +19,7 @@ export interface FileNode {
   is_directory: boolean;
   children: FileNode[];
   file_type: FileType;
-  modified: number; // Unix timestamp in milliseconds
+  modified: number | { secs_since_epoch: number; nanos_since_epoch: number }; // Rust SystemTime
 }
 
 export interface ScanProgress {
@@ -98,6 +98,8 @@ export interface SortConfig {
   field: SortField;
   order: SortOrder;
 }
+
+export type ViewMode = 'miller-columns' | 'largest-files';
 
 export enum LocationType {
   Storage = 'storage',
