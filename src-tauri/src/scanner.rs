@@ -1,22 +1,22 @@
 use crate::classifier::classify_file;
-use crate::types::{FileNode, FileType, PartialScanResult, ScanProgress};
-use rayon::prelude::*;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime};
+use crate::types::{FileNode, FileType, StreamingScanEvent};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Window};
+use tokio::fs;
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
-// Maximum depth to scan (prevents infinite recursion)
-const MAX_DEPTH: usize = 20;
+const MAX_CONCURRENT_DIRS: usize = 100; // Limit concurrent directory scans
+
+/// Global cancellation token for the current scan
+static SCAN_CANCELLATION: once_cell::sync::Lazy<Arc<Mutex<Option<CancellationToken>>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
 
 /// Validates if a path exists and is accessible
-///
-/// # Arguments
-/// * `path` - Path string to validate
-///
-/// # Returns
-/// Result indicating if the path is valid and accessible
 pub fn validate_path(path: &str) -> Result<bool, String> {
     let path_buf = PathBuf::from(path);
 
@@ -25,19 +25,13 @@ pub fn validate_path(path: &str) -> Result<bool, String> {
     }
 
     // Try to read metadata to check accessibility
-    match fs::metadata(&path_buf) {
+    match std::fs::metadata(&path_buf) {
         Ok(_) => Ok(true),
         Err(e) => Err(format!("Path is not accessible: {}", e)),
     }
 }
 
 /// Checks if the app has permission to access a path
-///
-/// # Arguments
-/// * `path` - Path string to check
-///
-/// # Returns
-/// Result indicating if the path is accessible (true) or needs permission (false)
 pub fn check_path_permissions(path: &str) -> Result<bool, String> {
     let path_buf = PathBuf::from(path);
 
@@ -48,192 +42,195 @@ pub fn check_path_permissions(path: &str) -> Result<bool, String> {
     // For macOS system paths, test access to TCC-protected locations
     #[cfg(target_os = "macos")]
     {
-        let is_root_or_system = path == "/"
-            || path == "/Volumes/Macintosh HD"
-            || path.starts_with("/System")
-            || path.starts_with("/Library")
-            || path.starts_with("/private")
-            || path.starts_with("/usr");
-
-        if is_root_or_system {
-            // Try to READ the TCC database - this ALWAYS requires Full Disk Access
-            // Just checking metadata isn't enough - we need to actually try to read it
-            let tcc_path = PathBuf::from("/Library/Application Support/com.apple.TCC/TCC.db");
-
-            match fs::File::open(&tcc_path) {
-                Ok(_) => {
-                    // Can open TCC database - Full Disk Access granted
-                    return Ok(true);
-                }
-                Err(_) => {
-                    // Cannot open TCC database - Full Disk Access NOT granted
-                    return Ok(false);
-                }
-            }
+        // Try to read the directory to check for Full Disk Access
+        match std::fs::read_dir(&path_buf) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
+            Err(e) => Err(format!("Error checking permissions: {}", e)),
         }
     }
 
-    // Try to read the directory to check if we have permission
-    if path_buf.is_dir() {
-        match fs::read_dir(&path_buf) {
-            Ok(mut entries) => {
-                // Try to actually read an entry to ensure we have real access
-                match entries.next() {
-                    Some(Ok(_)) => Ok(true),
-                    Some(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
-                    None => Ok(true), // Empty directory
-                    _ => Ok(true),
-                }
-            }
-            Err(e) => {
-                // Check if it's a permission error
-                if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    Ok(false)
-                } else {
-                    Err(format!("Error checking permissions: {}", e))
-                }
-            }
-        }
-    } else {
-        // For files, try to read metadata
-        match fs::metadata(&path_buf) {
+    #[cfg(not(target_os = "macos"))]
+    {
+        // On other platforms, just check if we can read metadata
+        match std::fs::metadata(&path_buf) {
             Ok(_) => Ok(true),
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    Ok(false)
-                } else {
-                    Err(format!("Error checking permissions: {}", e))
-                }
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
+            Err(e) => Err(format!("Error checking permissions: {}", e)),
         }
     }
 }
 
-/// Scans a directory recursively and builds a FileNode tree
-///
-/// # Arguments
-/// * `path` - Root path to scan
-/// * `window` - Tauri window for emitting progress events
-///
-/// # Returns
-/// Result containing the root FileNode or an error string
-pub async fn scan_directory(path: String, window: Window) -> Result<FileNode, String> {
+/// Cancel the current scan operation
+pub async fn cancel_scan() -> Result<(), String> {
+    let mut cancellation = SCAN_CANCELLATION.lock().await;
+    if let Some(token) = cancellation.take() {
+        token.cancel();
+        Ok(())
+    } else {
+        Err("No scan is currently running".to_string())
+    }
+}
+const BATCH_SIZE: usize = 200; // Emit after this many events (increased from 50 for better performance)
+const BATCH_INTERVAL_MS: u64 = 500; // Or after this many milliseconds (increased from 100ms to reduce UI updates)
+
+/// Represents a discovered node during progressive scanning
+#[derive(Clone, Debug)]
+struct DiscoveredNode {
+    path: PathBuf,
+    name: String,
+    size: u64,
+    is_directory: bool,
+    file_type: FileType,
+    modified: SystemTime,
+    parent_path: Option<PathBuf>,
+    is_complete: bool, // true if directory fully scanned
+}
+
+/// Shared registry of discovered nodes
+type NodeRegistry = Arc<Mutex<HashMap<PathBuf, DiscoveredNode>>>;
+
+pub async fn scan_directory_async(path: String, window: Window) -> Result<FileNode, String> {
     let root_path = PathBuf::from(&path);
 
-    // Validate the path first
-    validate_path(&path)?;
+    // Validate path
+    if !root_path.exists() {
+        return Err(format!("Path does not exist: {}", path));
+    }
 
-    // Run the blocking scan operation in a separate thread
-    let result = tokio::task::spawn_blocking(move || -> Result<FileNode, String> {
-        let mut files_scanned = 0u64;
-        let mut total_size = 0u64;
+    // Create new cancellation token for this scan
+    let cancel_token = CancellationToken::new();
+    {
+        let mut cancellation = SCAN_CANCELLATION.lock().await;
+        *cancellation = Some(cancel_token.clone());
+    }
+
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DIRS));
+
+    // Create channel for streaming events with larger buffer
+    // Use unbounded to prevent blocking during heavy scans
+    let (tx, mut rx) = mpsc::unbounded_channel::<StreamingScanEvent>();
+
+    // Spawn batching event emitter task
+    let window_clone = window.clone();
+    let event_task = tokio::spawn(async move {
+        let mut batch = Vec::new();
         let mut last_emit = Instant::now();
 
-        let result = build_tree_sync_progressive(
-            &root_path,
-            &window,
-            &mut files_scanned,
-            &mut total_size,
-            &mut last_emit,
-            true, // is_root
-        )?;
+        loop {
+            tokio::select! {
+                // Receive events from scanner
+                event = rx.recv() => {
+                    match event {
+                        Some(evt) => {
+                            batch.push(evt);
 
-        // Emit final complete result
-        let final_result = PartialScanResult {
-            tree: result.clone(),
-            files_scanned,
-            total_size,
-            is_complete: true,
-        };
+                            // Emit batch if size threshold reached or time elapsed
+                            let should_emit = batch.len() >= BATCH_SIZE ||
+                                last_emit.elapsed().as_millis() >= BATCH_INTERVAL_MS as u128;
 
-        if let Err(e) = window.emit("partial-scan-result", &final_result) {
-            eprintln!("Failed to emit final scan result: {}", e);
+                            if should_emit {
+                                for event in batch.drain(..) {
+                                    let _ = window_clone.emit("streaming-scan-event", &event);
+                                }
+                                last_emit = Instant::now();
+                            }
+                        }
+                        None => {
+                            for event in batch.drain(..) {
+                                let _ = window_clone.emit("streaming-scan-event", &event);
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Periodic flush even if batch not full
+                _ = sleep(Duration::from_millis(BATCH_INTERVAL_MS)) => {
+                    if !batch.is_empty() {
+                        for event in batch.drain(..) {
+                            let _ = window_clone.emit("streaming-scan-event", &event);
+                        }
+                        last_emit = Instant::now();
+                    }
+                }
+            }
         }
+    });
 
-        Ok(result)
-    })
-    .await
-    .map_err(|e| format!("Scan task failed: {}", e))??;
+    // Scan the directory tree with progressive updates for root level
+    let result = scan_root_with_updates(
+        root_path.clone(),
+        semaphore,
+        tx.clone(),
+        window.clone(),
+        cancel_token.clone(),
+    )
+    .await;
+
+    // Clear the cancellation token
+    {
+        let mut cancellation = SCAN_CANCELLATION.lock().await;
+        *cancellation = None;
+    }
+
+    let result = result?;
+
+    let total_files = count_files(&result);
+    let total_size = result.size;
+
+    // Send completion event
+    let _ = tx.send(StreamingScanEvent::Complete {
+        files_scanned: total_files,
+        total_size,
+    });
+
+    // Close channel and wait for event task to finish
+    drop(tx);
+    let _ = event_task.await;
 
     Ok(result)
 }
 
-/// Recursively builds a FileNode tree with progressive emission (synchronous version)
-///
-/// # Arguments
-/// * `path` - Current path to process
-/// * `window` - Tauri window for emitting progress events
-/// * `files_scanned` - Counter for total files scanned
-/// * `total_size` - Accumulator for total size
-/// * `last_emit` - Timestamp of last partial result emission
-/// * `is_root` - Whether this is the root node
-///
-/// # Returns
-/// Result containing a FileNode or an error string
-fn build_tree_sync_progressive(
-    path: &Path,
-    window: &Window,
-    files_scanned: &mut u64,
-    total_size: &mut u64,
-    last_emit: &mut Instant,
-    is_root: bool,
-) -> Result<FileNode, String> {
-    build_tree_sync_progressive_depth(
-        path,
-        window,
-        files_scanned,
-        total_size,
-        last_emit,
-        is_root,
-        0,
-    )
+/// Top-down progressive scanner that populates the registry
+fn scan_progressive(
+    path: PathBuf,
+    parent_path: Option<PathBuf>,
+    registry: NodeRegistry,
+    semaphore: Arc<Semaphore>,
+    event_tx: mpsc::UnboundedSender<StreamingScanEvent>,
+    cancel_token: CancellationToken,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+    Box::pin(async move {
+        scan_progressive_impl(
+            path,
+            parent_path,
+            registry,
+            semaphore,
+            event_tx,
+            cancel_token,
+        )
+        .await
+    })
 }
 
-fn build_tree_sync_progressive_depth(
-    path: &Path,
-    window: &Window,
-    files_scanned: &mut u64,
-    total_size: &mut u64,
-    last_emit: &mut Instant,
-    is_root: bool,
-    depth: usize,
-) -> Result<FileNode, String> {
-    // Only log root calls to reduce noise
-    if is_root {
-        eprintln!("=== SCANNING ROOT: {} ===", path.display());
+async fn scan_progressive_impl(
+    path: PathBuf,
+    parent_path: Option<PathBuf>,
+    registry: NodeRegistry,
+    semaphore: Arc<Semaphore>,
+    event_tx: mpsc::UnboundedSender<StreamingScanEvent>,
+    cancel_token: CancellationToken,
+) -> Result<(), String> {
+    // Check if scan was cancelled
+    if cancel_token.is_cancelled() {
+        return Err("Scan cancelled".to_string());
     }
 
-    // Stop if we've gone too deep (safety limit)
-    if depth > MAX_DEPTH {
-        eprintln!("Max depth ({}) reached at: {}", MAX_DEPTH, path.display());
-        return Ok(FileNode {
-            name: path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string(),
-            path: path.to_path_buf(),
-            size: 0,
-            is_directory: true,
-            children: vec![],
-            file_type: FileType::Other,
-            modified: SystemTime::UNIX_EPOCH,
-        });
-    }
+    let _permit = semaphore.acquire().await.expect("semaphore closed");
 
-    // Handle symbolic links - use symlink_metadata to avoid following them
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) => {
-            // Log permission errors but continue
-            eprintln!(
-                "Permission denied or error accessing {}: {}",
-                path.display(),
-                e
-            );
-            return Err(format!("Error accessing path: {}", e));
-        }
-    };
+    let metadata = fs::symlink_metadata(&path)
+        .await
+        .map_err(|e| format!("Cannot access {}: {}", path.display(), e))?;
 
     let name = path
         .file_name()
@@ -243,291 +240,265 @@ fn build_tree_sync_progressive_depth(
 
     let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
-    // Handle symbolic links as special files with zero size
-    if metadata.is_symlink() {
-        *files_scanned += 1;
+    if !metadata.is_dir() || metadata.is_symlink() {
+        // File or symlink - add to registry and emit node update
+        let size = metadata.len();
+        let file_type = classify_file(&path);
 
-        return Ok(FileNode {
+        registry.lock().await.insert(
+            path.clone(),
+            DiscoveredNode {
+                path: path.clone(),
+                name: name.clone(),
+                size,
+                is_directory: false,
+                file_type: file_type.clone(),
+                modified,
+                parent_path: parent_path.clone(),
+                is_complete: true,
+            },
+        );
+
+        // Emit incremental node update
+        let _ = event_tx.send(StreamingScanEvent::NodeUpdate {
+            path: path.to_string_lossy().to_string(),
+            parent_path: parent_path.map(|p| p.to_string_lossy().to_string()),
             name,
-            path: path.to_path_buf(),
-            size: 0,
+            size,
             is_directory: false,
-            children: vec![],
-            file_type: FileType::Other,
+            file_type,
+        });
+
+        return Ok(());
+    }
+
+    // Directory - add to registry as incomplete and emit node update
+    let file_type = FileType::Other;
+
+    registry.lock().await.insert(
+        path.clone(),
+        DiscoveredNode {
+            path: path.clone(),
+            name: name.clone(),
+            size: 0,
+            is_directory: true,
+            file_type: file_type.clone(),
             modified,
+            parent_path: parent_path.clone(),
+            is_complete: false,
+        },
+    );
+
+    // Emit incremental node update for directory
+    let _ = event_tx.send(StreamingScanEvent::NodeUpdate {
+        path: path.to_string_lossy().to_string(),
+        parent_path: parent_path.map(|p| p.to_string_lossy().to_string()),
+        name,
+        size: 0,
+        is_directory: true,
+        file_type,
+    });
+
+    // Read directory entries
+    let mut entries = fs::read_dir(&path)
+        .await
+        .map_err(|e| format!("Cannot read directory {}: {}", path.display(), e))?;
+
+    let mut child_handles = Vec::new();
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| format!("Error reading entry: {}", e))?
+    {
+        let entry_path = entry.path();
+        let registry_clone = registry.clone();
+        let sem = semaphore.clone();
+        let tx = event_tx.clone();
+        let parent = Some(path.clone());
+        let cancel_clone = cancel_token.clone();
+
+        let handle = tokio::task::spawn(async move {
+            scan_progressive(entry_path, parent, registry_clone, sem, tx, cancel_clone).await
+        });
+
+        child_handles.push(handle);
+    }
+
+    // Release permit before waiting
+    drop(_permit);
+
+    // Wait for all children
+    for handle in child_handles {
+        let _ = handle.await;
+    }
+
+    // Mark directory as complete
+    if let Some(node) = registry.lock().await.get_mut(&path) {
+        node.is_complete = true;
+    }
+
+    Ok(())
+}
+
+/// Special root-level scan that sends time-based partial tree snapshots
+async fn scan_root_with_updates(
+    path: PathBuf,
+    semaphore: Arc<Semaphore>,
+    event_tx: mpsc::UnboundedSender<StreamingScanEvent>,
+    _window: Window,
+    cancel_token: CancellationToken,
+) -> Result<FileNode, String> {
+    // Create shared registry for discovered nodes
+    let registry: NodeRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Start the progressive scan (no snapshots - frontend handles incremental updates)
+    let registry_clone = registry.clone();
+    let sem_clone = semaphore.clone();
+    let tx_clone = event_tx.clone();
+    let root_path_clone = path.clone();
+    let cancel_clone = cancel_token.clone();
+
+    scan_progressive(
+        root_path_clone,
+        None,
+        registry_clone,
+        sem_clone,
+        tx_clone,
+        cancel_clone,
+    )
+    .await?;
+
+    // Build a minimal tree just for the return value (Tauri command requires it)
+    // Frontend already has the complete tree from incremental updates
+    let reg = registry.lock().await;
+    let final_tree = build_tree_from_registry_with_depth(&reg, &path, 100)
+        .ok_or_else(|| "Failed to build final tree".to_string())?;
+
+    Ok(final_tree)
+}
+
+fn count_files(node: &FileNode) -> u64 {
+    if !node.is_directory {
+        return 1;
+    }
+
+    node.children.iter().map(|c| count_files(c)).sum()
+}
+
+fn build_tree_from_registry_with_depth(
+    registry: &HashMap<PathBuf, DiscoveredNode>,
+    path: &PathBuf,
+    max_depth: usize,
+) -> Option<FileNode> {
+    // Build parent->children index for O(1) lookups
+    let mut parent_to_children: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    for (child_path, child_node) in registry.iter() {
+        if let Some(parent) = &child_node.parent_path {
+            parent_to_children
+                .entry(parent.clone())
+                .or_insert_with(Vec::new)
+                .push(child_path.clone());
+        }
+    }
+
+    build_tree_recursive(registry, &parent_to_children, path, 0, max_depth)
+}
+
+fn build_tree_recursive(
+    registry: &HashMap<PathBuf, DiscoveredNode>,
+    parent_to_children: &HashMap<PathBuf, Vec<PathBuf>>,
+    path: &PathBuf,
+    current_depth: usize,
+    max_depth: usize,
+) -> Option<FileNode> {
+    let node = registry.get(path)?;
+
+    if !node.is_directory {
+        // Leaf node (file)
+        return Some(FileNode {
+            name: node.name.clone(),
+            path: node.path.clone(),
+            size: node.size,
+            is_directory: false,
+            file_type: node.file_type.clone(),
+            children: vec![],
+            modified: node.modified,
         });
     }
 
-    if metadata.is_file() {
-        // Handle file (including zero-byte files)
-        let size = metadata.len();
-        let file_type = classify_file(path);
+    // Directory node
+    let mut children = Vec::new();
+    let mut total_size = 0u64;
 
-        *files_scanned += 1;
-        *total_size += size;
-
-        // Emit progress event every 100 files
-        if *files_scanned % 100 == 0 {
-            emit_progress(window, path, *files_scanned, *total_size);
-        }
-
-        Ok(FileNode {
-            name,
-            path: path.to_path_buf(),
-            size,
-            is_directory: false,
-            children: vec![],
-            file_type,
-            modified,
-        })
-    } else if metadata.is_dir() {
-        // Handle directory (including empty directories)
-        let mut children = Vec::new();
-        let mut dir_size = 0u64;
-
-        if is_root {
-            eprintln!("=== Processing root directory: {} ===", path.display());
-        }
-
-        // Emit progress for directory
-        emit_progress(window, path, *files_scanned, *total_size);
-
-        // Read directory entries
-        match fs::read_dir(path) {
-            Ok(entries) => {
-                // Collect all entries first
-                let entry_paths: Vec<PathBuf> =
-                    entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
-
-                // For root directory, process children in parallel for better performance
-                if is_root && entry_paths.len() > 1 {
-                    eprintln!(
-                        "Processing {} top-level items in parallel",
-                        entry_paths.len()
-                    );
-
-                    // Use Arc to share state across threads
-                    let files_scanned_arc = Arc::new(Mutex::new(*files_scanned));
-                    let total_size_arc = Arc::new(Mutex::new(*total_size));
-                    let children_arc = Arc::new(Mutex::new(Vec::new()));
-                    let last_emit_arc = Arc::new(Mutex::new(*last_emit));
-
-                    // Process entries in parallel
-                    entry_paths.par_iter().for_each(|entry_path| {
-                        let mut local_files = 0u64;
-                        let mut local_size = 0u64;
-                        let mut local_last_emit = Instant::now();
-
-                        match build_tree_sync_progressive_depth(
-                            entry_path,
-                            window,
-                            &mut local_files,
-                            &mut local_size,
-                            &mut local_last_emit,
-                            false,
-                            depth + 1,
-                        ) {
-                            Ok(node) => {
-                                // Update shared state
-                                let mut fs = files_scanned_arc.lock().unwrap();
-                                *fs += local_files;
-                                let current_files = *fs;
-                                drop(fs);
-
-                                let mut ts = total_size_arc.lock().unwrap();
-                                *ts += local_size;
-                                let current_size = *ts;
-                                drop(ts);
-
-                                let mut children_lock = children_arc.lock().unwrap();
-                                children_lock.push(node);
-                                let children_count = children_lock.len();
-                                drop(children_lock);
-
-                                // Emit partial result every 3 completed directories or every 2 seconds
-                                let mut last_emit_lock = last_emit_arc.lock().unwrap();
-                                if children_count % 3 == 0 || last_emit_lock.elapsed().as_secs() > 2
-                                {
-                                    let children_snapshot = children_arc.lock().unwrap().clone();
-
-                                    let partial_tree = FileNode {
-                                        name: name.clone(),
-                                        path: path.to_path_buf(),
-                                        size: children_snapshot.iter().map(|c| c.size).sum(),
-                                        is_directory: true,
-                                        children: children_snapshot,
-                                        file_type: FileType::Other,
-                                        modified,
-                                    };
-
-                                    eprintln!(
-                                        "Emitting partial result: {} children, {} files",
-                                        children_count, current_files
-                                    );
-                                    emit_partial_result(
-                                        window,
-                                        &partial_tree,
-                                        current_files,
-                                        current_size,
-                                    );
-                                    *last_emit_lock = Instant::now();
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Error scanning {}: {}", entry_path.display(), e);
-                            }
-                        }
-                    });
-
-                    // Update counters from parallel results
-                    *files_scanned = *files_scanned_arc.lock().unwrap();
-                    *total_size = *total_size_arc.lock().unwrap();
-                    *last_emit = *last_emit_arc.lock().unwrap();
-
-                    // Collect final results
-                    children = children_arc.lock().unwrap().clone();
-                    dir_size = children.iter().map(|c| c.size).sum();
-
-                    eprintln!(
-                        "Parallel scan complete: {} children, {} files",
-                        children.len(),
-                        *files_scanned
-                    );
-                } else {
-                    // Sequential processing for non-root or small directories
-                    for entry_path in entry_paths {
-                        match build_tree_sync_progressive_depth(
-                            &entry_path,
-                            window,
-                            files_scanned,
-                            total_size,
-                            last_emit,
-                            false,
-                            depth + 1,
-                        ) {
-                            Ok(child_node) => {
-                                let is_child_dir = child_node.is_directory;
-                                dir_size += child_node.size;
-                                children.push(child_node);
-
-                                // Emit partial result after completing each top-level directory
-                                // OR if enough time has passed (500ms)
-                                let should_emit = is_root
-                                    && is_child_dir
-                                    && (children.len() % 5 == 0
-                                        || last_emit.elapsed().as_millis() > 500);
-
-                                if should_emit {
-                                    eprintln!("Condition met: is_root={}, is_child_dir={}, children={}, elapsed={}ms", 
-                                        is_root, is_child_dir, children.len(), last_emit.elapsed().as_millis());
-
-                                    let partial_tree = FileNode {
-                                        name: name.clone(),
-                                        path: path.to_path_buf(),
-                                        size: dir_size,
-                                        is_directory: true,
-                                        children: children.clone(),
-                                        file_type: FileType::Other,
-                                        modified,
-                                    };
-
-                                    emit_partial_result(
-                                        window,
-                                        &partial_tree,
-                                        *files_scanned,
-                                        *total_size,
-                                    );
-                                    *last_emit = Instant::now();
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Error scanning {}: {}", entry_path.display(), e);
-                            }
-                        }
-                    }
+    // Only recurse if we haven't hit max depth
+    if current_depth < max_depth {
+        if let Some(child_paths) = parent_to_children.get(path) {
+            for child_path in child_paths {
+                if let Some(child_tree) = build_tree_recursive(
+                    registry,
+                    parent_to_children,
+                    child_path,
+                    current_depth + 1,
+                    max_depth,
+                ) {
+                    total_size += child_tree.size;
+                    children.push(child_tree);
                 }
             }
-            Err(e) => {
-                eprintln!(
-                    "Permission denied reading directory {}: {}",
-                    path.display(),
-                    e
-                );
-                // Return empty directory node on permission error
-                // This allows the scan to continue even if some directories are inaccessible
-            }
         }
 
-        // Empty directories will have size 0 and empty children vec
-        Ok(FileNode {
-            name,
-            path: path.to_path_buf(),
-            size: dir_size, // Aggregate size of all children (0 for empty dirs)
-            is_directory: true,
-            children,
-            file_type: FileType::Other,
-            modified,
-        })
+        // Sort children by size (largest first) - only top 50 to save time
+        children.sort_by(|a, b| b.size.cmp(&a.size));
+        if children.len() > 50 {
+            children.truncate(50);
+        }
     } else {
-        // Handle other special file types (devices, pipes, etc.)
-        *files_scanned += 1;
-
-        Ok(FileNode {
-            name,
-            path: path.to_path_buf(),
-            size: 0,
-            is_directory: false,
-            children: vec![],
-            file_type: FileType::Other,
-            modified,
-        })
+        // At max depth - just calculate total size without building children
+        if let Some(child_paths) = parent_to_children.get(path) {
+            for child_path in child_paths {
+                if let Some(child_node) = registry.get(child_path) {
+                    total_size += if child_node.is_directory {
+                        // For directories at max depth, sum their subtree
+                        calculate_subtree_size(registry, parent_to_children, child_path)
+                    } else {
+                        child_node.size
+                    };
+                }
+            }
+        }
     }
+
+    Some(FileNode {
+        name: node.name.clone(),
+        path: node.path.clone(),
+        size: total_size,
+        is_directory: true,
+        file_type: FileType::Other,
+        children,
+        modified: node.modified,
+    })
 }
 
-/// Emits a partial scan result to the frontend
-///
-/// # Arguments
-/// * `window` - Tauri window to emit the event to
-/// * `tree` - Current state of the file tree
-/// * `files_scanned` - Total files scanned so far
-/// * `total_size` - Total size accumulated so far
-fn emit_partial_result(window: &Window, tree: &FileNode, files_scanned: u64, total_size: u64) {
-    eprintln!(
-        "Emitting partial result: {} files, {} children",
-        files_scanned,
-        tree.children.len()
-    );
+/// Calculate total size of a subtree without building the tree structure
+fn calculate_subtree_size(
+    registry: &HashMap<PathBuf, DiscoveredNode>,
+    parent_to_children: &HashMap<PathBuf, Vec<PathBuf>>,
+    path: &PathBuf,
+) -> u64 {
+    let mut total = 0u64;
 
-    let partial = PartialScanResult {
-        tree: tree.clone(),
-        files_scanned,
-        total_size,
-        is_complete: false,
-    };
+    if let Some(node) = registry.get(path) {
+        if !node.is_directory {
+            return node.size;
+        }
 
-    if let Err(e) = window.emit("partial-scan-result", &partial) {
-        eprintln!("Failed to emit partial result: {}", e);
-    } else {
-        eprintln!("Successfully emitted partial result");
+        if let Some(child_paths) = parent_to_children.get(path) {
+            for child_path in child_paths {
+                total += calculate_subtree_size(registry, parent_to_children, child_path);
+            }
+        }
     }
-}
 
-/// Emits a progress event to the frontend
-///
-/// # Arguments
-/// * `window` - Tauri window to emit the event to
-/// * `current_path` - Current path being scanned
-/// * `files_scanned` - Total files scanned so far
-/// * `total_size` - Total size accumulated so far
-fn emit_progress(window: &Window, current_path: &Path, files_scanned: u64, total_size: u64) {
-    let progress = ScanProgress {
-        current_path: current_path.to_string_lossy().to_string(),
-        files_scanned,
-        total_size,
-    };
-
-    // Emit event to frontend
-    if let Err(e) = window.emit("scan-progress", &progress) {
-        eprintln!("Failed to emit progress event: {}", e);
-    }
+    total
 }

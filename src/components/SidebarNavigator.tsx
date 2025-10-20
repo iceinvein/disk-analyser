@@ -9,8 +9,10 @@ import {
   $isScanning,
   setStorageLocations,
   setQuickAccessFolders,
+  selectLocation,
   startScan,
   showToast,
+  hasCachedScan,
 } from '../stores';
 import { scanDirectoryStreaming } from '../services/scanService';
 import type { StorageLocation } from '../types';
@@ -118,7 +120,6 @@ export function SidebarNavigator() {
   const isScanning = useStore($isScanning);
 
   const storagesHeadingId = useId();
-  const networkDisksHeadingId = useId();
   const foldersHeadingId = useId();
 
   // Load storage locations and quick access folders on mount
@@ -148,8 +149,13 @@ export function SidebarNavigator() {
   // Handle location selection
   const handleLocationClick = (location: StorageLocation) => {
     if (!isScanning) {
-      startScan(location.path);
-      scanDirectoryStreaming(location.path);
+      // Check if we have cached data
+      if (hasCachedScan(location.path)) {
+        selectLocation(location, false); // Load from cache
+      } else {
+        selectLocation(location, true); // Force new scan
+        scanDirectoryStreaming(location.path);
+      }
     }
   };
 
@@ -182,17 +188,17 @@ export function SidebarNavigator() {
   const storages = storageLocations.filter(
     (loc) => loc.location_type === LocationType.Storage,
   );
-  const networkDisks = storageLocations.filter(
-    (loc) => loc.location_type === LocationType.Network,
-  );
 
   return (
     <aside
-      className="w-64 h-screen bg-gray-900 border-r border-gray-800 flex flex-col"
+      className="w-64 h-screen flex flex-col"
       aria-label="Storage locations navigation"
     >
-      <div className="p-4 border-b border-gray-800">
-        <h2 className="text-lg font-semibold text-white">Disk Analyzer</h2>
+      <div className="p-6 border-b border-white/10">
+        <h2 className="text-xl font-bold text-white drop-shadow-lg">
+          Disk Analyzer
+        </h2>
+        <p className="text-xs text-gray-400 mt-1">Analyze & Clean Storage</p>
       </div>
 
       <nav
@@ -221,73 +227,37 @@ export function SidebarNavigator() {
                         ? 'true'
                         : 'false'
                     }
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-900 ${
+                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-400/50 focus:ring-offset-2 focus:ring-offset-transparent ${
                       selectedLocation?.path === location.path
-                        ? 'bg-blue-600 text-white'
-                        : 'text-gray-300 hover:bg-gray-800 hover:text-white'
+                        ? 'glass-light shadow-lg shadow-blue-500/20 text-white border-blue-400/30'
+                        : 'text-gray-300 hover:glass-light hover:text-white hover:shadow-md'
                     } ${isScanning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
                   >
-                    <span className="flex-shrink-0">
+                    <span className="flex-shrink-0 text-xl">
                       {getLocationIcon(location.location_type)}
                     </span>
                     <div className="flex-1 min-w-0">
-                      <div className="font-medium truncate">
+                      <div className="font-medium truncate text-sm">
                         {location.name}
                       </div>
                       {location.total_space !== undefined && (
-                        <div className="text-xs text-gray-400">
-                          {formatSize(location.available_space)} free of{' '}
-                          {formatSize(location.total_space)}
-                        </div>
-                      )}
-                    </div>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
-
-        {/* Network Disks Section */}
-        {networkDisks.length > 0 && (
-          <section aria-labelledby={networkDisksHeadingId}>
-            <h3
-              id={networkDisksHeadingId}
-              className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2"
-            >
-              Network Disks
-            </h3>
-            <ul className="space-y-1">
-              {networkDisks.map((location) => (
-                <li key={location.path}>
-                  <button
-                    type="button"
-                    onClick={() => handleLocationClick(location)}
-                    disabled={isScanning}
-                    aria-label={`Scan ${location.name}${location.total_space !== undefined ? `, ${formatSize(location.available_space)} free of ${formatSize(location.total_space)}` : ''}`}
-                    aria-pressed={
-                      selectedLocation?.path === location.path
-                        ? 'true'
-                        : 'false'
-                    }
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-900 ${
-                      selectedLocation?.path === location.path
-                        ? 'bg-blue-600 text-white'
-                        : 'text-gray-300 hover:bg-gray-800 hover:text-white'
-                    } ${isScanning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
-                  >
-                    <span className="flex-shrink-0">
-                      {getLocationIcon(location.location_type)}
-                    </span>
-                    <div className="flex-1 min-w-0">
-                      <div className="font-medium truncate">
-                        {location.name}
-                      </div>
-                      {location.total_space !== undefined && (
-                        <div className="text-xs text-gray-400">
-                          {formatSize(location.available_space)} free of{' '}
-                          {formatSize(location.total_space)}
-                        </div>
+                        <>
+                          <div className="text-xs text-gray-400 mt-1">
+                            {formatSize(
+                              location.total_space - location.available_space,
+                            )}{' '}
+                            of {formatSize(location.total_space)}
+                          </div>
+                          {/* Usage bar */}
+                          <div className="mt-2 h-1.5 bg-gray-800/50 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-gradient-to-r from-cyan-500 via-purple-500 to-pink-500 rounded-full transition-all duration-300"
+                              style={{
+                                width: `${((location.total_space - location.available_space) / location.total_space) * 100}%`,
+                              }}
+                            />
+                          </div>
+                        </>
                       )}
                     </div>
                   </button>
@@ -319,17 +289,17 @@ export function SidebarNavigator() {
                         ? 'true'
                         : 'false'
                     }
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-900 ${
+                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-purple-400/50 focus:ring-offset-2 focus:ring-offset-transparent ${
                       selectedLocation?.path === location.path
-                        ? 'bg-blue-600 text-white'
-                        : 'text-gray-300 hover:bg-gray-800 hover:text-white'
+                        ? 'glass-light shadow-lg shadow-purple-500/20 text-white border-purple-400/30'
+                        : 'text-gray-300 hover:glass-light hover:text-white hover:shadow-md'
                     } ${isScanning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
                   >
-                    <span className="flex-shrink-0">
+                    <span className="flex-shrink-0 text-lg">
                       {getLocationIcon(location.location_type)}
                     </span>
                     <div className="flex-1 min-w-0">
-                      <div className="font-medium truncate">
+                      <div className="font-medium truncate text-sm">
                         {location.name}
                       </div>
                     </div>
@@ -342,28 +312,20 @@ export function SidebarNavigator() {
       </nav>
 
       {/* Bottom Actions */}
-      <div className="p-4 border-t border-gray-800 space-y-2">
+      <div className="p-4 border-t border-white/10 space-y-2">
         <button
           type="button"
           onClick={handleChooseFolder}
           disabled={isScanning}
           aria-label="Choose custom folder to scan"
-          className={`w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg border border-gray-700 text-gray-300 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-900 ${
+          className={`w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl glass-light text-gray-300 transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-purple-400/50 focus:ring-offset-2 focus:ring-offset-transparent shadow-md ${
             isScanning
               ? 'opacity-50 cursor-not-allowed'
-              : 'hover:bg-gray-800 hover:text-white hover:border-gray-600'
+              : 'hover:text-white hover:shadow-lg hover:border-white/20'
           }`}
         >
           <PlusIcon aria-hidden="true" />
-          <span>Choose Folder...</span>
-        </button>
-
-        <button
-          type="button"
-          aria-label="Clean up more files"
-          className="w-full px-4 py-2 rounded-lg bg-blue-600 text-white font-medium hover:bg-blue-700 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-900"
-        >
-          Clean up more
+          <span className="font-medium">Choose Folder...</span>
         </button>
       </div>
     </aside>

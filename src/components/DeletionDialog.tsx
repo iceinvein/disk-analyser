@@ -201,10 +201,11 @@ export function DeletionDialog({ isOpen, onClose }: DeletionDialogProps) {
       onClose={handleClose}
       size="2xl"
       classNames={{
-        base: 'bg-gray-900 border border-gray-800',
-        header: 'border-b border-gray-800',
+        base: 'glass-strong shadow-2xl',
+        header: 'border-b border-white/10',
         body: 'py-6',
-        footer: 'border-t border-gray-800',
+        footer: 'border-t border-white/10',
+        backdrop: 'bg-black/60 backdrop-blur-md',
       }}
     >
       <ModalContent>

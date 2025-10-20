@@ -28,11 +28,11 @@ function ToastItem({ toast }: { toast: Toast }) {
     }
   }, [toast.id, toast.duration]);
 
-  const bgColor = {
-    success: 'bg-green-600',
-    error: 'bg-red-600',
-    warning: 'bg-yellow-600',
-    info: 'bg-blue-600',
+  const glassStyle = {
+    success: 'glass-strong border-green-400/30 shadow-lg shadow-green-500/20',
+    error: 'glass-strong border-red-400/30 shadow-lg shadow-red-500/20',
+    warning: 'glass-strong border-yellow-400/30 shadow-lg shadow-yellow-500/20',
+    info: 'glass-strong border-blue-400/30 shadow-lg shadow-blue-500/20',
   }[toast.type];
 
   const icon = {
@@ -80,7 +80,7 @@ function ToastItem({ toast }: { toast: Toast }) {
       animate={{ opacity: 1, y: 0, scale: 1 }}
       exit={{ opacity: 0, scale: 0.95 }}
       transition={{ duration: 0.2 }}
-      className={`${bgColor} text-white rounded-lg shadow-lg p-4 flex items-start gap-3 min-w-[300px]`}
+      className={`${glassStyle} text-white rounded-xl p-4 flex items-start gap-3 min-w-[300px]`}
     >
       <div className="flex-shrink-0">{icon}</div>
       <div className="flex-1">

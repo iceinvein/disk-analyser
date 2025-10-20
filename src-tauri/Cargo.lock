@@ -771,6 +771,7 @@ dependencies = [
  "crossbeam-channel",
  "dirs 5.0.1",
  "libc",
+ "once_cell",
  "rayon",
  "serde",
  "serde_json",
@@ -780,6 +781,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "tokio",
+ "tokio-util",
  "walkdir",
  "winapi",
 ]

@@ -93,20 +93,29 @@ impl NodeStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum StreamingScanEvent {
-    /// A file or directory node was discovered
-    #[serde(rename = "node_discovered")]
-    NodeDiscovered {
-        node: FileNode,
-        stats: NodeStats,
-        /// Path to parent directory (for tree building)
-        parent_path: Option<String>,
-    },
-    /// Progress update with aggregated stats
+    /// Progress update with aggregated stats (lightweight, sent frequently)
     #[serde(rename = "progress")]
     Progress {
         files_scanned: u64,
         total_size: u64,
         current_path: String,
+    },
+    /// Partial tree snapshot (heavier, sent periodically for UI updates)
+    #[serde(rename = "partial_tree")]
+    PartialTree {
+        tree: FileNode,
+        files_scanned: u64,
+        total_size: u64,
+    },
+    /// Node discovered - incremental update (lightweight, sent as nodes are found)
+    #[serde(rename = "node_update")]
+    NodeUpdate {
+        path: String,
+        parent_path: Option<String>,
+        name: String,
+        size: u64,
+        is_directory: bool,
+        file_type: FileType,
     },
     /// Scan completed
     #[serde(rename = "complete")]

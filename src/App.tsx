@@ -1,32 +1,83 @@
 import './styles.css';
-import { useState, useEffect, useCallback } from 'react';
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  useTransition,
+} from 'react';
 import { SidebarNavigator } from './components/SidebarNavigator';
 import { ProgressIndicator } from './components/ProgressIndicator';
 import { MillerColumns } from './components/MillerColumns';
 import { DeletionDialog } from './components/DeletionDialog';
 import { PermissionDialog } from './components/PermissionDialog';
-import { SunburstChart } from './components/SunburstChart';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ToastContainer } from './components/Toast';
 import { useStore } from '@nanostores/react';
+import type { FileNode } from './types';
 import {
   $currentView,
   $selectedItemsCount,
+  $selectedItems,
   clearSelection,
   $scanTarget,
   $showPermissionDialog,
   $permissionDialogPath,
 } from './stores';
-import { Button } from '@heroui/react';
 import { scanDirectoryStreaming } from './services/scanService';
 
+/**
+ * Format bytes into human-readable units
+ */
+function formatSize(bytes: number): string {
+  if (bytes === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const k = 1024;
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const value = bytes / k ** i;
+  return `${value.toFixed(2)} ${units[i]}`;
+}
+
 function App() {
-  const currentView = useStore($currentView);
+  // Use transition for non-blocking tree updates
+  const [isPending, startTransition] = useTransition();
+  const [currentView, setCurrentView] = useState<FileNode | null>(null);
+
+  // Subscribe to store with transition
+  useEffect(() => {
+    const unsubscribe = $currentView.subscribe((value) => {
+      startTransition(() => {
+        setCurrentView(value);
+      });
+    });
+    return unsubscribe;
+  }, []);
+
   const selectedCount = useStore($selectedItemsCount);
+  const selectedItems = useStore($selectedItems);
   const scanTarget = useStore($scanTarget);
   const showPermissionDialog = useStore($showPermissionDialog);
   const permissionDialogPath = useStore($permissionDialogPath);
   const [isDeletionDialogOpen, setIsDeletionDialogOpen] = useState(false);
+
+  // Calculate total size of selected items
+  const selectedTotalSize = useMemo(() => {
+    if (!currentView || selectedCount === 0) return 0;
+
+    let total = 0;
+    function calculateSize(node: FileNode): void {
+      if (selectedItems[node.path.toString()]) {
+        total += node.size || 0;
+      }
+      if (node.children) {
+        node.children.forEach((child) => {
+          calculateSize(child);
+        });
+      }
+    }
+    calculateSize(currentView);
+    return total;
+  }, [currentView, selectedItems, selectedCount]);
 
   const handleOpenDeletionDialog = useCallback(() => {
     if (selectedCount > 0) {
@@ -74,7 +125,6 @@ function App() {
         scanDirectoryStreaming(scanTarget);
       }
 
-      // Ctrl/Cmd + A - Select all (could be implemented in FileListView)
       // Ctrl/Cmd + D - Deselect all
       if ((e.ctrlKey || e.metaKey) && e.key === 'd' && !isInputField) {
         e.preventDefault();
@@ -94,7 +144,7 @@ function App() {
 
   return (
     <ErrorBoundary>
-      <div className="flex h-screen bg-gray-950 text-white">
+      <div className="flex h-screen text-white">
         {/* Keyboard shortcuts help - Screen reader only */}
         <div className="sr-only" role="region" aria-label="Keyboard shortcuts">
           <h2>Available Keyboard Shortcuts</h2>
@@ -103,14 +153,11 @@ function App() {
             <li>Escape: Clear selection or close dialog</li>
             <li>Ctrl/Cmd + R: Refresh current scan</li>
             <li>Ctrl/Cmd + D: Deselect all items</li>
-            <li>Arrow keys: Navigate file list</li>
-            <li>Space: Toggle selection in file list</li>
-            <li>Enter: Expand/collapse folder in file list</li>
           </ul>
         </div>
 
-        {/* Fixed Left Sidebar */}
-        <aside className="w-64 flex-shrink-0 border-r border-gray-800 overflow-hidden">
+        {/* Fixed Left Sidebar with glassmorphism */}
+        <aside className="w-64 flex-shrink-0 overflow-hidden glass-strong shadow-2xl">
           <SidebarNavigator />
         </aside>
 
@@ -118,52 +165,80 @@ function App() {
         <main className="flex-1 flex flex-col overflow-hidden" role="main">
           {currentView ? (
             <>
-              {/* Main layout: Miller columns (left) + Sunburst (right) */}
-              <div className="flex-1 flex overflow-hidden">
-                {/* Left: Miller Columns File Browser */}
-                <div className="flex-1 flex flex-col overflow-hidden relative">
-                  <MillerColumns />
+              {/* Full-width Miller Columns */}
+              <div className="flex-1 flex flex-col overflow-hidden">
+                <MillerColumns />
 
-                  {/* Action Bar - Bottom (shown when items are selected) */}
-                  {selectedCount > 0 && (
-                    <div
-                      className="flex-shrink-0 p-4 bg-gray-900 border-t border-gray-700 flex items-center justify-between"
-                      role="toolbar"
-                      aria-label="Selection actions"
-                    >
-                      <div
-                        className="text-sm text-gray-300"
-                        role="status"
-                        aria-live="polite"
-                      >
-                        {selectedCount} item{selectedCount !== 1 ? 's' : ''}{' '}
-                        selected
+                {/* Action Bar - Bottom (always visible) */}
+                <div
+                  className="flex-shrink-0 p-4 glass-strong border-t border-white/10 flex items-center justify-between"
+                  role="toolbar"
+                  aria-label="File actions"
+                >
+                  <div className="flex items-center gap-4">
+                    {isPending && (
+                      <div className="text-xs text-purple-400 flex items-center gap-2">
+                        <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse" />
+                        Updating...
                       </div>
-                      <div className="flex gap-2">
-                        <Button
-                          variant="light"
-                          onPress={() => clearSelection()}
+                    )}
+                    {selectedCount > 0 ? (
+                      <div className="text-sm" role="status" aria-live="polite">
+                        <span className="text-white font-semibold">
+                          {selectedCount}
+                        </span>
+                        <span className="text-gray-400">
+                          {' '}
+                          item{selectedCount !== 1 ? 's' : ''} selected
+                        </span>
+                        <span className="text-gray-500 mx-2">•</span>
+                        <span className="text-purple-300 font-medium">
+                          {formatSize(selectedTotalSize)}
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="text-sm text-gray-400">
+                        No items selected
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex gap-3">
+                    {selectedCount > 0 && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => clearSelection()}
                           aria-label="Clear selection (Ctrl+D)"
-                          className="text-gray-400 hover:text-white"
+                          className="px-4 py-2 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 transition-all duration-150 font-medium"
                         >
-                          Clear Selection
-                        </Button>
-                        <Button
-                          color="danger"
-                          onPress={handleOpenDeletionDialog}
+                          Clear
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleOpenDeletionDialog}
                           aria-label="Delete selected items (Delete key)"
-                          className="bg-red-600 hover:bg-red-700"
+                          className="px-4 py-2 rounded-lg bg-red-600/90 hover:bg-red-600 text-white font-medium transition-all duration-150 shadow-lg shadow-red-500/20 hover:shadow-red-500/30"
                         >
-                          Delete Selected
-                        </Button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* Right: Sunburst Chart (30% width) */}
-                <div className="w-[30%] min-w-[400px] max-w-[500px] flex-shrink-0 border-l border-gray-800 flex items-center justify-center p-8 bg-gray-900/50">
-                  <SunburstChart />
+                          <span className="flex items-center gap-2">
+                            <svg
+                              className="w-4 h-4"
+                              fill="none"
+                              stroke="currentColor"
+                              viewBox="0 0 24 24"
+                            >
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={2}
+                                d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                              />
+                            </svg>
+                            Delete
+                          </span>
+                        </button>
+                      </>
+                    )}
+                  </div>
                 </div>
               </div>
             </>

@@ -1,8 +1,6 @@
 mod classifier;
 mod safety;
 mod scanner;
-mod scanner_async;
-mod scanner_bfs;
 mod storage;
 mod types;
 
@@ -10,8 +8,7 @@ pub use classifier::{classify_file, get_category_stats, CategoryStats};
 pub use safety::{
     check_deletion_safety, check_multiple_deletions, delete_items, DeletionResult, SafetyCheck,
 };
-pub use scanner::{scan_directory, validate_path};
-pub use scanner_async::scan_directory_async;
+pub use scanner::{cancel_scan, check_path_permissions, scan_directory_async, validate_path};
 pub use storage::{get_quick_access_folders, get_storage_locations, LocationType, StorageLocation};
 pub use types::{
     FileNode, FileType, NodeStats, PartialScanResult, ScanProgress, StreamingScanEvent,
@@ -29,27 +26,25 @@ fn validate_path_command(path: String) -> Result<bool, String> {
     scanner::validate_path(&path)
 }
 
-/// Tauri command to scan a directory (parallel with progressive updates)
-#[tauri::command]
-async fn scan_directory_command(path: String, window: tauri::Window) -> Result<FileNode, String> {
-    // Use parallel scanner - it's fast and works well
-    scanner::scan_directory(path, window).await
-}
-
-/// Tauri command to scan a directory with streaming updates (new async scanner)
+/// Tauri command to scan a directory with streaming updates
 #[tauri::command]
 async fn scan_directory_streaming_command(
     path: String,
     window: tauri::Window,
 ) -> Result<FileNode, String> {
-    // Use new streaming scanner with progressive aggregation
-    scanner_async::scan_directory_async(path, window).await
+    scanner::scan_directory_async(path, window).await
 }
 
 /// Tauri command to check if the app has necessary permissions for a path
 #[tauri::command]
-fn check_path_permissions(path: String) -> Result<bool, String> {
+fn check_path_permissions_command(path: String) -> Result<bool, String> {
     scanner::check_path_permissions(&path)
+}
+
+/// Tauri command to cancel the current scan
+#[tauri::command]
+async fn cancel_scan_command() -> Result<(), String> {
+    scanner::cancel_scan().await
 }
 
 /// Tauri command to open System Settings to Full Disk Access (macOS only)
@@ -84,9 +79,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             validate_path_command,
-            scan_directory_command,
             scan_directory_streaming_command,
-            check_path_permissions,
+            check_path_permissions_command,
+            cancel_scan_command,
             open_full_disk_access_settings,
             safety::check_deletion_safety_command,
             safety::delete_items_command,

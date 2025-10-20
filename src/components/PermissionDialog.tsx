@@ -21,11 +21,14 @@ export function PermissionDialog({
   return (
     <>
       {/* Backdrop */}
-      <div className="fixed inset-0 bg-black/50 z-[9999]" onClick={onClose} />
+      <div
+        className="fixed inset-0 bg-black/60 backdrop-blur-md z-[9999]"
+        onClick={onClose}
+      />
 
       {/* Dialog */}
       <div className="fixed inset-0 z-[10000] flex items-center justify-center p-4">
-        <div className="bg-gray-900 rounded-lg shadow-xl max-w-lg w-full p-6 border border-gray-700">
+        <div className="glass-strong rounded-2xl shadow-2xl max-w-lg w-full p-6">
           {/* Header */}
           <div className="mb-4">
             <h2 className="text-xl font-semibold text-white">
@@ -40,7 +43,7 @@ export function PermissionDialog({
               needs Full Disk Access permission.
             </p>
 
-            <div className="bg-gray-800 p-4 rounded-lg space-y-3">
+            <div className="glass-light p-4 rounded-xl space-y-3">
               <p className="font-semibold text-white">
                 How to grant permission:
               </p>
@@ -53,7 +56,7 @@ export function PermissionDialog({
               </ol>
             </div>
 
-            <div className="bg-yellow-900/30 border border-yellow-700/50 p-3 rounded-lg">
+            <div className="glass-light border border-yellow-500/30 p-3 rounded-xl shadow-lg shadow-yellow-500/10">
               <p className="text-sm text-yellow-200">
                 <strong>Important:</strong> You must restart the app after
                 granting permission for changes to take effect.
@@ -64,14 +67,16 @@ export function PermissionDialog({
           {/* Footer */}
           <div className="flex gap-3 justify-end">
             <button
+              type="button"
               onClick={onClose}
-              className="px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors"
+              className="px-4 py-2 rounded-lg glass-light hover:border-white/20 text-gray-300 transition-all duration-200 shadow-md"
             >
               Cancel
             </button>
             <button
+              type="button"
               onClick={handleOpenSettings}
-              className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors"
+              className="px-4 py-2 rounded-lg glass-light border-blue-400/30 hover:border-blue-400/50 text-white transition-all duration-200 shadow-lg shadow-blue-500/20"
             >
               Open System Settings
             </button>

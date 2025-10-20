@@ -8,6 +8,8 @@ import {
   setCanResumeScan,
   $showPermissionDialog,
   $permissionDialogPath,
+  addNodeIncremental,
+  clearIncrementalState,
 } from '../stores';
 
 // Store the unlisten function for partial results
@@ -21,7 +23,7 @@ let unlistenStreamingEvents: UnlistenFn | null = null;
  */
 export async function checkPathPermissions(path: string): Promise<boolean> {
   try {
-    return await invoke<boolean>('check_path_permissions', { path });
+    return await invoke<boolean>('check_path_permissions_command', { path });
   } catch (error) {
     console.error('Permission check error:', error);
     return false;
@@ -79,24 +81,18 @@ export async function scanDirectory(path: string): Promise<void> {
       unlistenPartialResults();
     }
 
+    let scanCompleted = false;
+
     unlistenPartialResults = await listen<PartialScanResult>(
       'partial-scan-result',
       (event) => {
-        console.log('Received partial-scan-result event:', {
-          files_scanned: event.payload.files_scanned,
-          total_size: event.payload.total_size,
-          is_complete: event.payload.is_complete,
-          children_count: event.payload.tree.children.length,
-        });
-
         const { tree, is_complete } = event.payload;
 
         if (is_complete) {
-          console.log('Final result received, completing scan');
           // Final result - complete the scan
+          scanCompleted = true;
           completeScan(tree);
         } else {
-          console.log('Partial result received, updating UI');
           // Partial result - update the UI
           updatePartialScan(tree);
         }
@@ -106,8 +102,10 @@ export async function scanDirectory(path: string): Promise<void> {
     // Start the scan
     const result = await invoke<FileNode>('scan_directory_command', { path });
 
-    // Fallback: Complete the scan if no partial results were emitted
-    completeScan(result);
+    // Fallback: Complete the scan if no completion event was received
+    if (!scanCompleted) {
+      completeScan(result);
+    }
   } catch (error) {
     console.error('Scan error:', error);
 
@@ -201,42 +199,40 @@ export async function scanDirectoryStreaming(path: string): Promise<void> {
       unlistenStreamingEvents();
     }
 
+    // Clear previous incremental state
+    clearIncrementalState();
+
     // Listen for streaming progress events
-    console.log('[STREAMING] Setting up event listener for:', path);
     unlistenStreamingEvents = await listen<StreamingScanEvent>(
       'streaming-scan-event',
       (event) => {
         const payload = event.payload;
 
-        if (payload.type === 'node_discovered') {
-          // Just log for now - we'll use the final result
-          console.log(`[STREAMING] Discovered: ${payload.node.name}`);
-        } else if (payload.type === 'progress') {
-          console.log(
-            `[STREAMING] Progress: ${payload.files_scanned} files, ${(payload.total_size / 1024 / 1024).toFixed(2)} MB`,
+        if (payload.type === 'node_update') {
+          // Incremental node update - append to tree
+          addNodeIncremental(
+            payload.path,
+            payload.parent_path,
+            payload.name,
+            payload.size,
+            payload.is_directory,
+            payload.file_type,
           );
-        } else if (payload.type === 'complete') {
-          console.log(
-            `[STREAMING] Scan complete: ${payload.files_scanned} files, ${(payload.total_size / 1024 / 1024).toFixed(2)} MB`,
-          );
+        } else if (payload.type === 'partial_tree') {
+          // Update the UI with partial results
+          updatePartialScan(payload.tree);
         }
+        // Complete event is handled after invoke completes
       },
     );
 
-    console.log(
-      '[STREAMING] Starting scan via scan_directory_streaming_command',
-    );
     // Start the scan
     const result = await invoke<FileNode>('scan_directory_streaming_command', {
       path,
     });
-    console.log(
-      '[STREAMING] Scan command returned, result has',
-      result.children.length,
-      'children',
-    );
 
-    // Complete the scan with final result
+    // Mark scan as complete
+    // Always use the result from the backend - it's the complete, accurate tree
     completeScan(result);
   } catch (error) {
     console.error('Scan error:', error);

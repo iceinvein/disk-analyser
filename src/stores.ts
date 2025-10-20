@@ -5,6 +5,7 @@ import type {
   DeletionResult,
   SortConfig,
   StorageLocation,
+  FileType,
 } from './types';
 import { perfMonitor } from './utils/performance';
 
@@ -34,6 +35,9 @@ export const $scanError = atom<string | null>(null);
 export const $canResumeScan = atom<boolean>(false);
 export const $showPermissionDialog = atom<boolean>(false);
 export const $permissionDialogPath = atom<string>('');
+
+// Scan cache - stores scan results by path
+export const $scanCache = map<Record<string, FileNode>>({});
 
 // Map stores for complex objects
 export const $sortConfig = map<SortConfig>({
@@ -73,11 +77,68 @@ export function setQuickAccessFolders(folders: StorageLocation[]): void {
 }
 
 /**
- * Select a location and start scanning it
- * @param location - The storage location to select
+ * Check if a path has cached scan results
+ * @param path - The path to check
+ * @returns true if cached results exist
  */
-export function selectLocation(location: StorageLocation): void {
+export function hasCachedScan(path: string): boolean {
+  const cache = $scanCache.get();
+  return path in cache;
+}
+
+/**
+ * Get cached scan result for a path
+ * @param path - The path to get cached results for
+ * @returns Cached FileNode or null if not found
+ */
+export function getCachedScan(path: string): FileNode | null {
+  const cache = $scanCache.get();
+  return cache[path] || null;
+}
+
+/**
+ * Store scan result in cache
+ * @param path - The path that was scanned
+ * @param result - The scan result to cache
+ */
+export function cacheScanResult(path: string, result: FileNode): void {
+  $scanCache.setKey(path, result);
+}
+
+/**
+ * Clear all cached scan results
+ */
+export function clearScanCache(): void {
+  $scanCache.set({});
+}
+
+/**
+ * Select a location and load from cache or start scanning
+ * @param location - The storage location to select
+ * @param forceRescan - Force a new scan even if cached
+ */
+export function selectLocation(
+  location: StorageLocation,
+  forceRescan = false,
+): void {
   $selectedLocation.set(location);
+
+  // Check cache first unless forcing rescan
+  if (!forceRescan && hasCachedScan(location.path)) {
+    const cached = getCachedScan(location.path);
+    if (cached) {
+      $scanResult.set(cached);
+      $currentView.set(cached);
+      $scanTarget.set(location.path);
+      showToast(
+        'info',
+        'Loaded from Cache',
+        'Using previously scanned data. Click "Rescan" to refresh.',
+      );
+      return;
+    }
+  }
+
   startScan(location.path);
 }
 
@@ -116,18 +177,154 @@ export function updatePartialScan(result: FileNode): void {
   }
 }
 
+// Incremental tree building state
+const nodeRegistry = new Map<string, FileNode>();
+const childrenMap = new Map<string, string[]>(); // parent_path -> child paths
+let rootPath: string | null = null;
+let lastUpdateTime = 0;
+let pendingUpdate = false;
+const UPDATE_INTERVAL_MS = 2000; // Only update UI every 2 seconds (reduced frequency for better performance)
+
+/**
+ * Add a node incrementally to the tree (streaming updates)
+ * @param path - Node path
+ * @param parentPath - Parent node path (null for root)
+ * @param name - Node name
+ * @param size - Node size
+ * @param isDirectory - Whether node is a directory
+ * @param fileType - File type
+ */
+export function addNodeIncremental(
+  path: string,
+  parentPath: string | null,
+  name: string,
+  size: number,
+  isDirectory: boolean,
+  fileType: FileType,
+): void {
+  // Create the node
+  const node: FileNode = {
+    name,
+    path,
+    size,
+    is_directory: isDirectory,
+    children: [],
+    file_type: fileType,
+    modified: Date.now(),
+  };
+
+  // Add to registry
+  nodeRegistry.set(path, node);
+
+  // Track root (first node with no parent)
+  if (!parentPath && !rootPath) {
+    rootPath = path;
+  }
+
+  // Track parent-child relationship
+  if (parentPath) {
+    const siblings = childrenMap.get(parentPath) || [];
+    siblings.push(path);
+    childrenMap.set(parentPath, siblings);
+  }
+
+  // Time-based throttling - only update UI every 500ms
+  const now = Date.now();
+  if (
+    now - lastUpdateTime >= UPDATE_INTERVAL_MS &&
+    rootPath &&
+    !pendingUpdate
+  ) {
+    lastUpdateTime = now;
+    scheduleTreeUpdate();
+  }
+}
+
+/**
+ * Schedule a tree update using requestAnimationFrame for smooth rendering
+ */
+function scheduleTreeUpdate(): void {
+  if (pendingUpdate || !rootPath) return;
+
+  pendingUpdate = true;
+  requestAnimationFrame(() => {
+    if (rootPath) {
+      const tree = buildTreeFromRegistry(rootPath);
+
+      if (tree) {
+        $scanResult.set(tree);
+        // Update currentView to show streaming updates
+        $currentView.set(tree);
+      }
+    }
+    pendingUpdate = false;
+  });
+}
+
+/**
+ * Build a tree from the node registry
+ * Note: This is expensive for large trees - only call when necessary
+ */
+function buildTreeFromRegistry(rootPath: string): FileNode | null {
+  const node = nodeRegistry.get(rootPath);
+  if (!node) return null;
+
+  // For files, return as-is
+  if (!node.is_directory) {
+    return { ...node };
+  }
+
+  // For directories, recursively build children
+  const childPaths = childrenMap.get(rootPath) || [];
+  const children: FileNode[] = [];
+  let totalSize = 0;
+
+  for (const childPath of childPaths) {
+    const childTree = buildTreeFromRegistry(childPath);
+    if (childTree) {
+      children.push(childTree);
+      totalSize += childTree.size;
+    }
+  }
+
+  // Sort children by size (largest first)
+  // Note: This is expensive for large directories - consider removing during scan
+  children.sort((a, b) => b.size - a.size);
+
+  // Return directory with calculated size and children
+  return {
+    ...node,
+    size: totalSize, // Aggregate size from children
+    children,
+  };
+}
+
+/**
+ * Clear incremental tree building state
+ */
+export function clearIncrementalState(): void {
+  nodeRegistry.clear();
+  childrenMap.clear();
+  rootPath = null;
+  lastUpdateTime = 0;
+  pendingUpdate = false;
+}
+
 /**
  * Complete the scan operation with results
  * @param result - The root FileNode of the scanned directory
  */
 export function completeScan(result: FileNode): void {
-  const duration = perfMonitor.end('scan-operation');
-  if (duration) {
-    console.log(`Scan completed in ${(duration / 1000).toFixed(2)}s`);
-  }
+  perfMonitor.end('scan-operation');
   $scanResult.set(result);
   $currentView.set(result);
   $isScanning.set(false);
+
+  // Cache the scan result
+  const scanTarget = $scanTarget.get();
+  if (scanTarget) {
+    cacheScanResult(scanTarget, result);
+  }
 }
 
 /**
@@ -307,9 +504,25 @@ export function resumeScan(): void {
 /**
  * Cancel current scan
  */
-export function cancelScan(): void {
-  $isScanning.set(false);
-  $scanError.set(null);
-  $canResumeScan.set(false);
-  showToast('info', 'Scan Cancelled', 'The scan operation was cancelled.');
+export async function cancelScan(): Promise<void> {
+  try {
+    // Call backend to cancel the scan
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('cancel_scan_command');
+
+    // Update UI state
+    $isScanning.set(false);
+    $scanError.set(null);
+    $canResumeScan.set(false);
+    showToast('info', 'Scan Cancelled', 'The scan operation was cancelled.');
+  } catch (error) {
+    console.error('Failed to cancel scan:', error);
+    // Still update UI even if backend cancel fails
+    $isScanning.set(false);
+    showToast(
+      'warning',
+      'Scan Stopped',
+      'The scan was stopped but may still be running in the background.',
+    );
+  }
 }

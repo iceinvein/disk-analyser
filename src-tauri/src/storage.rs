@@ -46,6 +46,11 @@ pub fn get_storage_locations() -> Result<Vec<StorageLocation>, String> {
                     continue;
                 }
 
+                // Skip disk images (mounted .dmg files)
+                if is_disk_image(&path) {
+                    continue;
+                }
+
                 let (total, available) = get_volume_stats(&path).unwrap_or((0, 0));
 
                 // Determine if it's a network drive (basic heuristic)
@@ -67,6 +72,24 @@ pub fn get_storage_locations() -> Result<Vec<StorageLocation>, String> {
     }
 
     Ok(locations)
+}
+
+#[cfg(target_os = "macos")]
+fn is_disk_image(path: &std::path::Path) -> bool {
+    use std::process::Command;
+
+    // Use diskutil to check if this is a disk image
+    // Disk images typically have "Disk Image" in their protocol
+    if let Ok(output) = Command::new("diskutil").arg("info").arg(path).output() {
+        if let Ok(info) = String::from_utf8(output.stdout) {
+            // Check for disk image indicators
+            return info.contains("Disk Image")
+                || info.contains("Apple_HFS") && info.contains("disk image")
+                || info.contains("Protocol:") && info.contains("Disk Image");
+        }
+    }
+
+    false
 }
 
 #[cfg(target_os = "windows")]

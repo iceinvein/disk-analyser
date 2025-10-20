@@ -42,16 +42,25 @@ export interface NodeStats {
 
 export type StreamingScanEvent =
   | {
-      type: 'node_discovered';
-      node: FileNode;
-      stats: NodeStats;
-      parent_path?: string;
-    }
-  | {
       type: 'progress';
       files_scanned: number;
       total_size: number;
       current_path: string;
+    }
+  | {
+      type: 'partial_tree';
+      tree: FileNode;
+      files_scanned: number;
+      total_size: number;
+    }
+  | {
+      type: 'node_update';
+      path: string;
+      parent_path: string | null;
+      name: string;
+      size: number;
+      is_directory: boolean;
+      file_type: FileType;
     }
   | {
       type: 'complete';

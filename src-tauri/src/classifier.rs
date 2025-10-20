@@ -23,17 +23,29 @@ pub fn classify_file(path: &Path) -> FileType {
         .and_then(|ext| ext.to_str())
         .map(|s| s.to_lowercase());
 
+    // Special handling for macOS Photos Library - check parent path
+    let path_str = path.to_string_lossy().to_lowercase();
+    let is_photos_library = path_str.contains(".photoslibrary") || path_str.contains("photo booth");
+
     match extension.as_deref() {
         // Documents
         Some("pdf") | Some("doc") | Some("docx") | Some("txt") | Some("rtf") | Some("odt") => {
             FileType::Document
         }
-        // Images
+        // Images (including Apple Photos Library internal formats)
         Some("jpg") | Some("jpeg") | Some("png") | Some("gif") | Some("bmp") | Some("svg")
-        | Some("webp") | Some("ico") => FileType::Image,
-        // Videos
+        | Some("webp") | Some("ico") | Some("heic") | Some("heif") | Some("raw") | Some("cr2")
+        | Some("nef") | Some("dng") | Some("tiff") | Some("tif") => FileType::Image,
+        // Apple Photos Library database files - treat as images since they store photo data
+        Some("photos") | Some("photoslibrary") if is_photos_library => FileType::Image,
+        Some("db") | Some("sqlite") | Some("sqlite-shm") | Some("sqlite-wal")
+            if is_photos_library =>
+        {
+            FileType::Image
+        }
+        // Videos (including Apple formats)
         Some("mp4") | Some("avi") | Some("mov") | Some("mkv") | Some("flv") | Some("wmv")
-        | Some("webm") => FileType::Video,
+        | Some("webm") | Some("m4v") => FileType::Video,
         // Audio
         Some("mp3") | Some("wav") | Some("flac") | Some("aac") | Some("ogg") | Some("m4a")
         | Some("wma") => FileType::Audio,
@@ -52,6 +64,8 @@ pub fn classify_file(path: &Path) -> FileType {
         Some("sys") | Some("ini") | Some("cfg") | Some("conf") | Some("log") => {
             FileType::SystemFile
         }
+        // Apple plist files in Photos Library
+        Some("plist") if is_photos_library => FileType::Image,
         // Default to Other
         _ => FileType::Other,
     }
