@@ -24,3 +24,12 @@ dist-ssr
 *.sw?
 
 .kiro
+
+*.provisionprofile
+*.pkg
+
+# Entitlements backup files
+src-tauri/entitlements.plist.backup.*
+
+# Keep scripts directory structure
+!scripts/

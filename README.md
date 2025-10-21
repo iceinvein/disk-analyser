@@ -283,10 +283,23 @@ bun run tauri dev
 ### Building for Production
 
 ```bash
-# Build the application
-bun run tauri build
+# Build for direct distribution (Apple Silicon)
+bun run tauri build -- --target aarch64-apple-darwin
 
-# The built application will be in src-tauri/target/release/
+# Build universal binary (Intel + Apple Silicon)
+./scripts/build_universal.sh
+
+# Build for Mac App Store
+./scripts/build_for_mas.sh
+```
+
+See [scripts/README.md](scripts/README.md) for detailed build documentation.
+
+### Version Management
+
+```bash
+# Bump version and optionally build
+./scripts/bump_version.sh [major|minor|patch]
 ```
 
 ## Usage

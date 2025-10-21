@@ -29,17 +29,19 @@ export default defineConfig(async () => ({
       ignored: ["**/src-tauri/**"],
     },
   },
-  rollupOptions: {
-			output: {
-				manualChunks: (path) => {
-					const reversedPath = path.split("/").reverse();
-					return reversedPath[reversedPath.indexOf("node_modules") - 1];
-				},
-			},
-			onwarn(warning, warn) {
-				if (warning.code === "MODULE_LEVEL_DIRECTIVE") return;
-				warn(warning);
-			},
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: (path) => {
+          const reversedPath = path.split("/").reverse();
+          return reversedPath[reversedPath.indexOf("node_modules") - 1];
+        },
+      },
+      onwarn(warning, warn) {
+        if (warning.code === "MODULE_LEVEL_DIRECTIVE") return;
+        warn(warning);
+      },
 		},
 		chunkSizeWarningLimit: 1600,
+  }
 }));
