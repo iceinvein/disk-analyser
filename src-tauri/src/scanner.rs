@@ -1,14 +1,16 @@
 use crate::classifier::classify_file;
 use crate::types::{FileNode, FileType, StreamingScanEvent};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use tauri::{Emitter, Window};
 use tokio::fs;
 use tokio::sync::{mpsc, Mutex, Semaphore};
-use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 const MAX_CONCURRENT_DIRS: usize = 100; // Limit concurrent directory scans
 
@@ -71,8 +73,8 @@ pub async fn cancel_scan() -> Result<(), String> {
         Err("No scan is currently running".to_string())
     }
 }
-const BATCH_SIZE: usize = 200; // Emit after this many events (increased from 50 for better performance)
-const BATCH_INTERVAL_MS: u64 = 500; // Or after this many milliseconds (increased from 100ms to reduce UI updates)
+
+const BATCH_INTERVAL_MS: u64 = 500; // Progress update interval in milliseconds
 
 /// Represents a discovered node during progressive scanning
 #[derive(Clone, Debug)]
@@ -89,6 +91,16 @@ struct DiscoveredNode {
 
 /// Shared registry of discovered nodes
 type NodeRegistry = Arc<Mutex<HashMap<PathBuf, DiscoveredNode>>>;
+
+/// Progress stats for tracking scan progress
+#[derive(Debug)]
+struct ProgressStats {
+    files_scanned: u64,
+    total_size: u64,
+    current_path: String,
+    #[cfg(unix)]
+    seen_inodes: HashSet<u64>, // Track inodes to avoid counting hard links multiple times
+}
 
 pub async fn scan_directory_async(path: String, window: Window) -> Result<FileNode, String> {
     let root_path = PathBuf::from(&path);
@@ -107,53 +119,51 @@ pub async fn scan_directory_async(path: String, window: Window) -> Result<FileNo
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DIRS));
 
+    // Create progress tracker
+    let progress = Arc::new(Mutex::new(ProgressStats {
+        files_scanned: 0,
+        total_size: 0,
+        current_path: path.clone(),
+        #[cfg(unix)]
+        seen_inodes: HashSet::new(),
+    }));
+
     // Create channel for streaming events with larger buffer
     // Use unbounded to prevent blocking during heavy scans
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamingScanEvent>();
 
-    // Spawn batching event emitter task
+    // Spawn progress emitter task - emits progress updates periodically
     let window_clone = window.clone();
-    let event_task = tokio::spawn(async move {
-        let mut batch = Vec::new();
-        let mut last_emit = Instant::now();
-
+    let progress_clone = progress.clone();
+    let progress_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(BATCH_INTERVAL_MS));
         loop {
-            tokio::select! {
-                // Receive events from scanner
-                event = rx.recv() => {
-                    match event {
-                        Some(evt) => {
-                            batch.push(evt);
+            interval.tick().await;
 
-                            // Emit batch if size threshold reached or time elapsed
-                            let should_emit = batch.len() >= BATCH_SIZE ||
-                                last_emit.elapsed().as_millis() >= BATCH_INTERVAL_MS as u128;
+            let (files_scanned, total_size, current_path) = {
+                let stats = progress_clone.lock().await;
+                (
+                    stats.files_scanned,
+                    stats.total_size,
+                    stats.current_path.clone(),
+                )
+            };
+            let _ = window_clone.emit(
+                "streaming-scan-event",
+                &StreamingScanEvent::Progress {
+                    files_scanned,
+                    total_size,
+                    current_path,
+                },
+            );
+        }
+    });
 
-                            if should_emit {
-                                for event in batch.drain(..) {
-                                    let _ = window_clone.emit("streaming-scan-event", &event);
-                                }
-                                last_emit = Instant::now();
-                            }
-                        }
-                        None => {
-                            for event in batch.drain(..) {
-                                let _ = window_clone.emit("streaming-scan-event", &event);
-                            }
-                            break;
-                        }
-                    }
-                }
-                // Periodic flush even if batch not full
-                _ = sleep(Duration::from_millis(BATCH_INTERVAL_MS)) => {
-                    if !batch.is_empty() {
-                        for event in batch.drain(..) {
-                            let _ = window_clone.emit("streaming-scan-event", &event);
-                        }
-                        last_emit = Instant::now();
-                    }
-                }
-            }
+    // Spawn completion event handler
+    let window_clone2 = window.clone();
+    let event_task = tokio::spawn(async move {
+        while let Some(evt) = rx.recv().await {
+            let _ = window_clone2.emit("streaming-scan-event", &evt);
         }
     });
 
@@ -161,11 +171,14 @@ pub async fn scan_directory_async(path: String, window: Window) -> Result<FileNo
     let result = scan_root_with_updates(
         root_path.clone(),
         semaphore,
-        tx.clone(),
+        progress.clone(),
         window.clone(),
         cancel_token.clone(),
     )
     .await;
+
+    // Abort progress task
+    progress_task.abort();
 
     // Clear the cancellation token
     {
@@ -197,7 +210,7 @@ fn scan_progressive(
     parent_path: Option<PathBuf>,
     registry: NodeRegistry,
     semaphore: Arc<Semaphore>,
-    event_tx: mpsc::UnboundedSender<StreamingScanEvent>,
+    progress: Arc<Mutex<ProgressStats>>,
     cancel_token: CancellationToken,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
     Box::pin(async move {
@@ -206,7 +219,7 @@ fn scan_progressive(
             parent_path,
             registry,
             semaphore,
-            event_tx,
+            progress,
             cancel_token,
         )
         .await
@@ -218,7 +231,7 @@ async fn scan_progressive_impl(
     parent_path: Option<PathBuf>,
     registry: NodeRegistry,
     semaphore: Arc<Semaphore>,
-    event_tx: mpsc::UnboundedSender<StreamingScanEvent>,
+    progress: Arc<Mutex<ProgressStats>>,
     cancel_token: CancellationToken,
 ) -> Result<(), String> {
     // Check if scan was cancelled
@@ -240,39 +253,68 @@ async fn scan_progressive_impl(
 
     let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
-    if !metadata.is_dir() || metadata.is_symlink() {
-        // File or symlink - add to registry and emit node update
+    // Skip symlinks entirely to avoid double-counting and confusion
+    if metadata.is_symlink() {
+        return Ok(());
+    }
+
+    if !metadata.is_dir() {
+        // Regular file - add to registry and update progress
+        // On Unix, use blocks * 512 to get actual disk usage (handles sparse files correctly)
+        #[cfg(unix)]
+        let size = metadata.blocks() * 512;
+
+        #[cfg(not(unix))]
         let size = metadata.len();
+
         let file_type = classify_file(&path);
 
-        registry.lock().await.insert(
-            path.clone(),
-            DiscoveredNode {
-                path: path.clone(),
-                name: name.clone(),
-                size,
-                is_directory: false,
-                file_type: file_type.clone(),
-                modified,
-                parent_path: parent_path.clone(),
-                is_complete: true,
-            },
-        );
+        // Check if this file was already scanned (shouldn't happen, but be safe)
+        let is_new = {
+            let mut reg = registry.lock().await;
+            let was_present = reg.contains_key(&path);
+            reg.insert(
+                path.clone(),
+                DiscoveredNode {
+                    path: path.clone(),
+                    name: name.clone(),
+                    size,
+                    is_directory: false,
+                    file_type: file_type.clone(),
+                    modified,
+                    parent_path: parent_path.clone(),
+                    is_complete: true,
+                },
+            );
+            !was_present
+        };
 
-        // Emit incremental node update
-        let _ = event_tx.send(StreamingScanEvent::NodeUpdate {
-            path: path.to_string_lossy().to_string(),
-            parent_path: parent_path.map(|p| p.to_string_lossy().to_string()),
-            name,
-            size,
-            is_directory: false,
-            file_type,
-        });
+        // Only update progress stats if this is a new file
+        if is_new {
+            let mut stats = progress.lock().await;
+
+            // On Unix, check if we've seen this inode before (hard link detection)
+            #[cfg(unix)]
+            let is_new_inode = {
+                let inode = metadata.ino();
+                stats.seen_inodes.insert(inode)
+            };
+
+            #[cfg(not(unix))]
+            let is_new_inode = true;
+
+            // Only count size if this is a new inode (not a hard link)
+            if is_new_inode {
+                stats.files_scanned += 1;
+                stats.total_size += size;
+            }
+            stats.current_path = path.to_string_lossy().to_string();
+        }
 
         return Ok(());
     }
 
-    // Directory - add to registry as incomplete and emit node update
+    // Directory - add to registry
     let file_type = FileType::Other;
 
     registry.lock().await.insert(
@@ -289,15 +331,11 @@ async fn scan_progressive_impl(
         },
     );
 
-    // Emit incremental node update for directory
-    let _ = event_tx.send(StreamingScanEvent::NodeUpdate {
-        path: path.to_string_lossy().to_string(),
-        parent_path: parent_path.map(|p| p.to_string_lossy().to_string()),
-        name,
-        size: 0,
-        is_directory: true,
-        file_type,
-    });
+    // Update progress with current directory
+    {
+        let mut stats = progress.lock().await;
+        stats.current_path = path.to_string_lossy().to_string();
+    }
 
     // Read directory entries
     let mut entries = fs::read_dir(&path)
@@ -314,12 +352,20 @@ async fn scan_progressive_impl(
         let entry_path = entry.path();
         let registry_clone = registry.clone();
         let sem = semaphore.clone();
-        let tx = event_tx.clone();
+        let progress_clone = progress.clone();
         let parent = Some(path.clone());
         let cancel_clone = cancel_token.clone();
 
         let handle = tokio::task::spawn(async move {
-            scan_progressive(entry_path, parent, registry_clone, sem, tx, cancel_clone).await
+            scan_progressive(
+                entry_path,
+                parent,
+                registry_clone,
+                sem,
+                progress_clone,
+                cancel_clone,
+            )
+            .await
         });
 
         child_handles.push(handle);
@@ -345,17 +391,17 @@ async fn scan_progressive_impl(
 async fn scan_root_with_updates(
     path: PathBuf,
     semaphore: Arc<Semaphore>,
-    event_tx: mpsc::UnboundedSender<StreamingScanEvent>,
+    progress: Arc<Mutex<ProgressStats>>,
     _window: Window,
     cancel_token: CancellationToken,
 ) -> Result<FileNode, String> {
     // Create shared registry for discovered nodes
     let registry: NodeRegistry = Arc::new(Mutex::new(HashMap::new()));
 
-    // Start the progressive scan (no snapshots - frontend handles incremental updates)
+    // Start the progressive scan
     let registry_clone = registry.clone();
     let sem_clone = semaphore.clone();
-    let tx_clone = event_tx.clone();
+    let progress_clone = progress.clone();
     let root_path_clone = path.clone();
     let cancel_clone = cancel_token.clone();
 
@@ -364,15 +410,16 @@ async fn scan_root_with_updates(
         None,
         registry_clone,
         sem_clone,
-        tx_clone,
+        progress_clone,
         cancel_clone,
     )
     .await?;
 
-    // Build a minimal tree just for the return value (Tauri command requires it)
-    // Frontend already has the complete tree from incremental updates
+    // Build a shallow tree for initial display (depth 2)
+    // This prevents freezing when dealing with millions of files
+    // Deeper levels can be loaded on-demand by the frontend
     let reg = registry.lock().await;
-    let final_tree = build_tree_from_registry_with_depth(&reg, &path, 100)
+    let final_tree = build_tree_from_registry_with_depth(&reg, &path, 2)
         .ok_or_else(|| "Failed to build final tree".to_string())?;
 
     Ok(final_tree)
@@ -402,12 +449,25 @@ fn build_tree_from_registry_with_depth(
         }
     }
 
-    build_tree_recursive(registry, &parent_to_children, path, 0, max_depth)
+    // Don't pre-calculate all sizes - calculate on-demand with memoization
+    // This way we only calculate sizes for nodes we actually include in the tree
+    let mut size_cache: HashMap<PathBuf, u64> = HashMap::new();
+
+    build_tree_recursive_lazy(
+        registry,
+        &parent_to_children,
+        &mut size_cache,
+        path,
+        0,
+        max_depth,
+    )
 }
 
-fn build_tree_recursive(
+/// Build tree recursively with lazy size calculation (only for nodes we include)
+fn build_tree_recursive_lazy(
     registry: &HashMap<PathBuf, DiscoveredNode>,
     parent_to_children: &HashMap<PathBuf, Vec<PathBuf>>,
+    size_cache: &mut HashMap<PathBuf, u64>,
     path: &PathBuf,
     current_depth: usize,
     max_depth: usize,
@@ -415,7 +475,7 @@ fn build_tree_recursive(
     let node = registry.get(path)?;
 
     if !node.is_directory {
-        // Leaf node (file)
+        // File - return immediately with its size
         return Some(FileNode {
             name: node.name.clone(),
             path: node.path.clone(),
@@ -427,52 +487,39 @@ fn build_tree_recursive(
         });
     }
 
-    // Directory node
+    // Directory - build children if within depth limit
     let mut children = Vec::new();
-    let mut total_size = 0u64;
 
-    // Only recurse if we haven't hit max depth
     if current_depth < max_depth {
         if let Some(child_paths) = parent_to_children.get(path) {
             for child_path in child_paths {
-                if let Some(child_tree) = build_tree_recursive(
+                if let Some(child_tree) = build_tree_recursive_lazy(
                     registry,
                     parent_to_children,
+                    size_cache,
                     child_path,
                     current_depth + 1,
                     max_depth,
                 ) {
-                    total_size += child_tree.size;
                     children.push(child_tree);
                 }
             }
         }
 
-        // Sort children by size (largest first) - only top 50 to save time
+        // Sort by size and limit to top 100
         children.sort_by(|a, b| b.size.cmp(&a.size));
-        if children.len() > 50 {
-            children.truncate(50);
-        }
-    } else {
-        // At max depth - just calculate total size without building children
-        if let Some(child_paths) = parent_to_children.get(path) {
-            for child_path in child_paths {
-                if let Some(child_node) = registry.get(child_path) {
-                    total_size += if child_node.is_directory {
-                        // For directories at max depth, sum their subtree
-                        calculate_subtree_size(registry, parent_to_children, child_path)
-                    } else {
-                        child_node.size
-                    };
-                }
-            }
+        if children.len() > 100 {
+            children.truncate(100);
         }
     }
+
+    // Calculate size for this directory (with memoization)
+    let dir_size = calculate_dir_size_lazy(registry, parent_to_children, size_cache, path);
 
     Some(FileNode {
         name: node.name.clone(),
         path: node.path.clone(),
-        size: total_size,
+        size: dir_size,
         is_directory: true,
         file_type: FileType::Other,
         children,
@@ -480,25 +527,36 @@ fn build_tree_recursive(
     })
 }
 
-/// Calculate total size of a subtree without building the tree structure
-fn calculate_subtree_size(
+/// Calculate directory size recursively with memoization
+fn calculate_dir_size_lazy(
     registry: &HashMap<PathBuf, DiscoveredNode>,
     parent_to_children: &HashMap<PathBuf, Vec<PathBuf>>,
+    cache: &mut HashMap<PathBuf, u64>,
     path: &PathBuf,
 ) -> u64 {
-    let mut total = 0u64;
-
-    if let Some(node) = registry.get(path) {
-        if !node.is_directory {
-            return node.size;
-        }
-
-        if let Some(child_paths) = parent_to_children.get(path) {
-            for child_path in child_paths {
-                total += calculate_subtree_size(registry, parent_to_children, child_path);
-            }
-        }
+    // Check cache first
+    if let Some(&size) = cache.get(path) {
+        return size;
     }
 
-    total
+    let node = match registry.get(path) {
+        Some(n) => n,
+        None => return 0,
+    };
+
+    let size = if !node.is_directory {
+        node.size
+    } else {
+        // Sum all children
+        let mut total = 0u64;
+        if let Some(child_paths) = parent_to_children.get(path) {
+            for child_path in child_paths {
+                total += calculate_dir_size_lazy(registry, parent_to_children, cache, child_path);
+            }
+        }
+        total
+    };
+
+    cache.insert(path.clone(), size);
+    size
 }

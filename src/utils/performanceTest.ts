@@ -196,8 +196,14 @@ export function testSortPerformance(nodes: FileNode[]) {
         case 'type':
           return a.file_type.localeCompare(b.file_type);
         case 'modified': {
-          const aTime = typeof a.modified === 'number' ? a.modified : a.modified.secs_since_epoch;
-          const bTime = typeof b.modified === 'number' ? b.modified : b.modified.secs_since_epoch;
+          const aTime =
+            typeof a.modified === 'number'
+              ? a.modified
+              : a.modified.secs_since_epoch;
+          const bTime =
+            typeof b.modified === 'number'
+              ? b.modified
+              : b.modified.secs_since_epoch;
           return bTime - aTime;
         }
         default:

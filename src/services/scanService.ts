@@ -1,15 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { FileNode, PartialScanResult, StreamingScanEvent } from '../types';
+import type { FileNode, StreamingScanEvent } from '../types';
 import {
   completeScan,
-  updatePartialScan,
   handleScanError,
   setCanResumeScan,
   $showPermissionDialog,
   $permissionDialogPath,
-  addNodeIncremental,
-  clearIncrementalState,
+  updateProgress,
 } from '../stores';
 
 // Store the unlisten function for partial results
@@ -76,36 +74,17 @@ export async function scanDirectory(path: string): Promise<void> {
       }
     }
 
-    // Set up listener for partial results (progressive scanning)
+    // Clean up old listeners
     if (unlistenPartialResults) {
       unlistenPartialResults();
+      unlistenPartialResults = null;
     }
-
-    let scanCompleted = false;
-
-    unlistenPartialResults = await listen<PartialScanResult>(
-      'partial-scan-result',
-      (event) => {
-        const { tree, is_complete } = event.payload;
-
-        if (is_complete) {
-          // Final result - complete the scan
-          scanCompleted = true;
-          completeScan(tree);
-        } else {
-          // Partial result - update the UI
-          updatePartialScan(tree);
-        }
-      },
-    );
 
     // Start the scan
     const result = await invoke<FileNode>('scan_directory_command', { path });
 
-    // Fallback: Complete the scan if no completion event was received
-    if (!scanCompleted) {
-      completeScan(result);
-    }
+    // Complete the scan with the final result
+    completeScan(result);
   } catch (error) {
     console.error('Scan error:', error);
 
@@ -199,30 +178,21 @@ export async function scanDirectoryStreaming(path: string): Promise<void> {
       unlistenStreamingEvents();
     }
 
-    // Clear previous incremental state
-    clearIncrementalState();
-
     // Listen for streaming progress events
     unlistenStreamingEvents = await listen<StreamingScanEvent>(
       'streaming-scan-event',
       (event) => {
         const payload = event.payload;
 
-        if (payload.type === 'node_update') {
-          // Incremental node update - append to tree
-          addNodeIncremental(
-            payload.path,
-            payload.parent_path,
-            payload.name,
-            payload.size,
-            payload.is_directory,
-            payload.file_type,
-          );
-        } else if (payload.type === 'partial_tree') {
-          // Update the UI with partial results
-          updatePartialScan(payload.tree);
+        if (payload.type === 'progress') {
+          // Update progress stats only - no tree building
+          updateProgress({
+            current_path: payload.current_path,
+            files_scanned: payload.files_scanned,
+            total_size: payload.total_size,
+          });
         }
-        // Complete event is handled after invoke completes
+        // Ignore node_update and partial_tree events - we'll build tree at completion
       },
     );
 

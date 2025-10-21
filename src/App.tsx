@@ -13,6 +13,7 @@ import { LargestFilesView } from './components/LargestFilesView';
 import { ViewModeTabs } from './components/ViewModeTabs';
 import { DeletionDialog } from './components/DeletionDialog';
 import { PermissionDialog } from './components/PermissionDialog';
+import { ScanningOverlay } from './components/ScanningOverlay';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ToastContainer } from './components/Toast';
 import { useStore } from '@nanostores/react';
@@ -26,6 +27,7 @@ import {
   $showPermissionDialog,
   $permissionDialogPath,
   $viewMode,
+  $isScanning,
 } from './stores';
 import { scanDirectoryStreaming } from './services/scanService';
 
@@ -45,6 +47,7 @@ function App() {
   // Use transition for non-blocking tree updates
   const [isPending, startTransition] = useTransition();
   const [currentView, setCurrentView] = useState<FileNode | null>(null);
+  const isScanning = useStore($isScanning);
 
   // Subscribe to store with transition
   useEffect(() => {
@@ -304,6 +307,9 @@ function App() {
           onClose={() => $showPermissionDialog.set(false)}
           path={permissionDialogPath}
         />
+
+        {/* Scanning Overlay - Shows during scan with stats */}
+        {isScanning && <ScanningOverlay />}
 
         {/* Toast Notifications */}
         <ToastContainer />

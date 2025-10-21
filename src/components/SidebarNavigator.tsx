@@ -244,7 +244,8 @@ export function SidebarNavigator() {
                         <>
                           <div className="text-xs text-gray-400 mt-1">
                             {formatSize(
-                              location.total_space - (location.available_space ?? 0),
+                              location.total_space -
+                                (location.available_space ?? 0),
                             )}{' '}
                             of {formatSize(location.total_space)}
                           </div>

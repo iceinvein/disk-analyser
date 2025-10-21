@@ -70,7 +70,7 @@ export function ViewModeTabs() {
       <div className="flex gap-1 px-4 py-2">
         {tabs.map((tab) => {
           const isActive = viewMode === tab.id;
-          
+
           return (
             <button
               key={tab.id}
@@ -101,4 +101,3 @@ export function ViewModeTabs() {
     </div>
   );
 }
-

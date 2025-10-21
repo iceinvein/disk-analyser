@@ -21,12 +21,18 @@ function formatSize(bytes: number): string {
 }
 
 // Format date - handle both number (ms) and SystemTime object from Rust
-function formatDate(timestamp: number | { secs_since_epoch: number; nanos_since_epoch: number }): string {
+function formatDate(
+  timestamp: number | { secs_since_epoch: number; nanos_since_epoch: number },
+): string {
   let ms: number;
 
   if (typeof timestamp === 'number') {
     ms = timestamp;
-  } else if (timestamp && typeof timestamp === 'object' && 'secs_since_epoch' in timestamp) {
+  } else if (
+    timestamp &&
+    typeof timestamp === 'object' &&
+    'secs_since_epoch' in timestamp
+  ) {
     // Rust SystemTime serialized as {secs_since_epoch, nanos_since_epoch}
     ms = timestamp.secs_since_epoch * 1000;
   } else {
@@ -84,10 +90,18 @@ function VirtualizedFileTable({ files }: { files: FileNode[] }) {
         {/* Table Header - Sticky */}
         <div className="grid grid-cols-[40px_minmax(300px,2fr)_80px_100px_120px] gap-6 px-6 py-3 bg-gray-900/80 backdrop-blur-sm sticky top-0 z-10 border-b border-white/10">
           <div></div>
-          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Name</div>
-          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider text-center">Type</div>
-          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider text-right">Size</div>
-          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider text-right">Modified</div>
+          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+            Name
+          </div>
+          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider text-center">
+            Type
+          </div>
+          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider text-right">
+            Size
+          </div>
+          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider text-right">
+            Modified
+          </div>
         </div>
 
         {/* Virtualized Rows */}
@@ -140,7 +154,8 @@ function VirtualizedFileTable({ files }: { files: FileNode[] }) {
                     variant="flat"
                     classNames={{
                       base: 'bg-purple-500/10 border border-purple-500/20 px-2 min-w-[48px] h-6 flex items-center justify-center',
-                      content: 'text-purple-300 font-mono text-xs uppercase leading-none',
+                      content:
+                        'text-purple-300 font-mono text-xs uppercase leading-none',
                     }}
                   >
                     {getFileExtension(file.name)}
@@ -174,13 +189,13 @@ function collectAllFiles(node: FileNode, files: FileNode[] = []): FileNode[] {
   if (!node.is_directory) {
     files.push(node);
   }
-  
+
   if (node.children && node.children.length > 0) {
     for (const child of node.children) {
       collectAllFiles(child, files);
     }
   }
-  
+
   return files;
 }
 
